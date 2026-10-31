@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# CADMUS-CR-12 - static analysis with SonarQube on V1.
+#
+#   ~/lab-tools/scan-sonar.sh -t <token>          (token: SonarQube > My Account > Security)
+#   ~/lab-tools/scan-sonar.sh -t <token> -v       also import the Valgrind XML report
+#
+# SonarQube Community Build has no C/C++ analyser of its own. This sandbox adds
+# the community plugin sonar-cxx, which reads the reports of C/C++ analysers.
+# The script runs two of them and hands their reports to SonarQube:
+#   cppcheck   - reads every translation unit
+#   clang-tidy - the Clang static analyzer plus the bugprone-* and CERT checks;
+#                it needs to know how each file is compiled, so the script asks
+#                CMake for a compilation database first (build-cc/)
+# With -v it also runs the application under Valgrind (XML output), so the
+# memory errors the dynamic tier found appear in SonarQube as issues too.
+#
+# Project key and sources come from sonar-project.properties in the repository.
+set -euo pipefail
+
+APP="${APP:-/home/user/cadmus-vulnshop-cpp-cr}"
+HOST="${SONAR_HOST_URL:-http://sq1:9000}"
+TOKEN="${SONAR_TOKEN:-}"
+WITH_VALGRIND=0
+
+while getopts "t:vh" opt; do
+  case "$opt" in
+    t) TOKEN="$OPTARG" ;;
+    v) WITH_VALGRIND=1 ;;
+    *) sed -n '2,17p' "$0"; exit 1 ;;
+  esac
+done
+[ -n "$TOKEN" ] || { echo "Usage: $0 -t <SonarQube token> [-v]"; exit 1; }
+
+cd "$APP"
+mkdir -p reports
+
+echo "[1/4] Compilation database (cmake -> build-cc/compile_commands.json)"
+cmake -S . -B build-cc -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >reports/cmake.log 2>&1 \
+  || { echo "cmake failed - see reports/cmake.log"; exit 1; }
+
+echo "[2/4] cppcheck"
+cppcheck --std=c++17 --enable=warning,style,performance,portability --inconclusive \
+         --inline-suppr --xml --xml-version=2 --quiet \
+         -I include -I src src include third_party 2> reports/cppcheck.xml
+echo "      $(grep -c '<error ' reports/cppcheck.xml || true) diagnostics -> reports/cppcheck.xml"
+
+echo "[3/4] clang-tidy (about half a minute)"
+CHECKS='-*,clang-analyzer-*,bugprone-*,cert-*,-bugprone-easily-swappable-parameters,-cert-err58-cpp'
+run-clang-tidy -quiet -p build-cc -checks="$CHECKS" "$APP/(src|third_party)/" \
+  > reports/clang-tidy.txt 2>/dev/null || true
+echo "      $(grep -cE '(warning|error): ' reports/clang-tidy.txt || true) diagnostics -> reports/clang-tidy.txt"
+
+VG_ARGS=()
+if [ "$WITH_VALGRIND" = 1 ]; then
+  echo "[4/4] Valgrind with XML output over the request corpus, then SonarQube"
+  make -s
+  mkdir -p /var/lib/vulnshop/attachments 2>/dev/null || true
+  echo "invoice 4711" > /var/lib/vulnshop/attachments/invoice.txt 2>/dev/null || true
+  valgrind --xml=yes --xml-file=reports/valgrind.xml --leak-check=full \
+           ./build/vulnshop config/sandbox.ini >/dev/null 2>&1 &
+  VG=$!
+  sleep 8
+  ./tools/replay-corpus.sh http://127.0.0.1:8080 >/dev/null 2>&1 || true
+  kill -TERM "$VG" 2>/dev/null || true
+  wait "$VG" 2>/dev/null || true
+  VG_ARGS=(-Dsonar.cxx.valgrind.reportPaths=reports/valgrind.xml)
+else
+  echo "[4/4] SonarQube (Valgrind import skipped - add -v to include it)"
+fi
+
+echo "      -> $HOST"
+sonar-scanner \
+  -Dsonar.host.url="$HOST" \
+  -Dsonar.token="$TOKEN" \
+  -Dsonar.cxx.file.suffixes=.cpp,.cc,.c,.h,.hpp \
+  -Dsonar.cxx.includeDirectories=include,src \
+  -Dsonar.cxx.jsonCompilationDatabase=build-cc/compile_commands.json \
+  -Dsonar.cxx.cppcheck.reportPaths=reports/cppcheck.xml \
+  -Dsonar.cxx.clangtidy.reportPaths=reports/clang-tidy.txt \
+  "${VG_ARGS[@]}"
+
+KEY=$(sed -n 's/^sonar.projectKey=//p' sonar-project.properties)
+echo
+echo "Done. On SC1 open http://localhost:9000/dashboard?id=${KEY}"
+echo "Issues and Security Hotspots are separate tabs. They are different kinds of claim."

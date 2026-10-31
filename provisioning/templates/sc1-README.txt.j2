@@ -1,0 +1,69 @@
+CADMUS-CR-12  -  Secure Coding C/C++  -  Cyber Range sandbox
+=============================================================
+
+You are logged in to SC1, the developer workstation (VM1).
+
+Machines in this sandbox
+------------------------
+  SC1  {{ cr12_ip_sc1 }}   Windows workstation (this machine): VS Code (C/C++, Remote-SSH),
+                      GCC-win64 (MinGW-w64), CMake, make, Git, Snyk CLI, Postman
+  V1   {{ cr12_ip_v1 }}   Linux build host with Docker and Valgrind (framework VM2):
+                      the application is built, run and analysed here
+  SQ1  {{ cr12_ip_sq1 }}   SonarQube (SAST) in Docker
+
+Account on all three machines:  {{ cr12_trainee_user }} / {{ cr12_trainee_password }}
+
+Why the application lives on V1
+-------------------------------
+cadmus-vulnshop-cpp-cr is POSIX C++ (sockets, unistd.h, popen) and its dynamic
+analysis tier - Valgrind, AddressSanitizer, UBSan - only exists on Linux. You
+work from SC1, but the code is built and run on V1:
+
+  1. Open VS Code, press F1, choose "Remote-SSH: Connect to Host..." and pick v1.
+     Password: {{ cr12_trainee_password }}. (The first connection takes a minute - VS Code
+     installs its server on V1.)
+  2. File -> Open Folder -> {{ cr12_app_dir }}
+  3. Terminal -> New Terminal opens a shell ON V1. Everything in the lab guide
+     that starts with ./ or ~/lab-tools/ is typed there.
+
+Without VS Code:  open "V1 terminal" on the desktop, or type  ssh v1  in a
+Windows terminal.
+
+URLs (open them in the browser on SC1)
+--------------------------------------
+  SonarQube                  http://localhost:9000        (forwarded to SQ1:9000)
+  The application            http://localhost:{{ cr12_app_port }}/shop   once it runs on V1 -
+                             VS Code forwards the port for you (Ports tab).
+                             Without VS Code:  ssh -L {{ cr12_app_port }}:127.0.0.1:{{ cr12_app_port }} v1
+
+Tools on V1  (details: ~/README-CR12.txt on V1)
+------------
+  ~/lab-tools/verify-v1.sh              environment check of V1
+  ~/lab-tools/valgrind-container.sh     Valgrind (Memcheck) over the request corpus
+  ~/lab-tools/replay-each.sh            sanitizers, one request per process
+  ~/lab-tools/scan-sonar.sh -t <token>  cppcheck + clang-tidy -> SonarQube
+
+Notes
+-----
+* SonarQube Community Build has no C/C++ analyser of its own. This sandbox uses
+  the community plugin sonar-cxx, which imports cppcheck, clang-tidy and
+  Valgrind reports. The repository's tools\scan-sonar.ps1 and its build
+  wrapper are for the commercial C/C++ analyser and do not apply here.
+* SonarQube first login: admin / admin, then set a throwaway password.
+* GCC-win64 on SC1 compiles portable C/C++ - not this application, which
+  needs POSIX headers.
+* Environment check of SC1:
+    powershell -ExecutionPolicy Bypass -File {{ cr12_lab_dir_win }}\verify-cr-env.ps1
+
+Level E1 (CI/CD pipeline)
+-------------------------
+GitHub Actions run on GitHub, not in this sandbox. Fork
+{{ cr12_app_repo | regex_replace('\\.git$', '') }}
+to your own GitHub account and complete .github/workflows/security-pipeline.yml
+in the fork.
+
+Safety
+------
+The application is deliberately exploitable (memory corruption, command
+injection). It binds to 127.0.0.1 with config/sandbox.ini - never use
+config/vulnshop.ini outside this sandbox, never expose it. Read SAFETY.md.

@@ -1,0 +1,81 @@
+# CADMUS-CR-12 · Secure Coding C/C++ (BTCMP-02) · sandbox topology
+#
+# Machines follow section 2.1 "Virtual Machine list" of the CR-12 Cyber Range
+# Training Scenario Framework:
+#
+#   VM1  sc1   Windows 11 developer workstation (trainee logs in here over RDP)
+#   VM2  v1    Docker host with Valgrind - in this sandbox also the Linux build
+#              host: the application is POSIX C++ and its dynamic analysis tier
+#              (Valgrind, AddressSanitizer, UBSan) only exists on Linux
+#   VM3  sq1   Docker host running SonarQube (SAST)
+#
+# Same layout and tested base images as the CADMUS-CR-13/CR-14 sandboxes: one
+# user-accessible LAN behind a single router. Image and flavor names are the
+# ones published on cr.cybersecurity-training.cti.gr (Sandboxes > Images).
+
+name: cr-12-secure-coding-cpp
+
+hosts:
+  - name: sc1
+    flavor: c4_r8_d60
+    base_box:
+      image: windows-11-x86_64
+      # Managed over SSH: on cr.cybersecurity-training.cti.gr this image never
+      # opens the WinRM listener (CR-14 allocation 1368 timed out on 5986).
+      # First boot takes about five minutes before SSH answers.
+      mgmt_user: windows
+      mgmt_protocol: ssh
+    hidden: false
+
+  - name: sq1
+    flavor: c4_r8_d40
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+      mgmt_protocol: ssh
+    hidden: false
+
+  - name: v1
+    flavor: c4_r8_d40
+    base_box:
+      image: ubuntu-noble-x86_64
+      mgmt_user: ubuntu
+      mgmt_protocol: ssh
+    hidden: false
+
+routers:
+  - name: router
+    flavor: standard.small
+    base_box:
+      image: debian-12-x86_64
+      mgmt_user: debian
+      mgmt_protocol: ssh
+    hidden: false
+
+networks:
+  - name: dev-lan
+    cidr: 10.10.10.0/24
+    accessible_by_user: true
+    hidden: false
+
+wan:
+  name: internet-connection
+  cidr: 10.10.100.0/24
+
+net_mappings:
+  - host: sc1
+    network: dev-lan
+    ip: 10.10.10.10
+  - host: sq1
+    network: dev-lan
+    ip: 10.10.10.20
+  - host: v1
+    network: dev-lan
+    ip: 10.10.10.30
+
+router_mappings:
+  - router: router
+    network: dev-lan
+    ip: 10.10.10.1
+
+groups: []

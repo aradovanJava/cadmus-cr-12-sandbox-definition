@@ -1,0 +1,13 @@
+# CADMUS-CR-12 - Valgrind container image ({{ cr12_valgrind_image }}), built on V1.
+# Same toolchain the repository's docker-compose "valgrind" service installs on
+# every run, installed once. /var/lib/vulnshop is writable for any user so
+# tools/scan-valgrind.sh works when the container runs as the trainee.
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      g++ make valgrind curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /var/lib/vulnshop/attachments \
+ && chmod -R 0777 /var/lib/vulnshop
+WORKDIR /work

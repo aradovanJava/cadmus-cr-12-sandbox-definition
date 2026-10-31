@@ -1,0 +1,42 @@
+# CADMUS-CR-12 · VM3 / SQ1 · SAST server (SonarQube Community Build + sonar-cxx)
+# Managed by the sandbox provisioning - edits are lost on re-provisioning.
+#
+#   cd /opt/cr12 && docker compose up -d      # start
+#   docker compose logs -f sonarqube          # follow start-up (1-3 min)
+#
+# First login: admin / admin, then SonarQube forces a new password. Use a
+# throwaway one - this instance is disposable.
+#
+# The image is pinned to a Community Build that the sonar-cxx plugin in
+# /opt/cr12/sonar-extensions/plugins was tested against. Community Build has no
+# C/C++ analyser of its own; sonar-cxx adds the language and imports the
+# cppcheck / clang-tidy / Valgrind reports that ~/lab-tools/scan-sonar.sh on V1
+# produces.
+#
+# Port 9000 is published on the lab LAN (V1 runs the scanner against
+# http://sq1:9000); on SC1 it is forwarded to http://localhost:9000.
+
+services:
+  sonarqube:
+    image: {{ cr12_sonarqube_image }}
+    container_name: cadmus-sonarqube
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_logs:/opt/sonarqube/logs
+      - /opt/cr12/sonar-extensions:/opt/sonarqube/extensions
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+      nproc:
+        soft: 8192
+        hard: 8192
+
+volumes:
+  sonar_data:
+  sonar_logs:

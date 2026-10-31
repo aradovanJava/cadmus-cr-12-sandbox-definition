@@ -1,0 +1,678 @@
+---
+# CADMUS-CR-12 · Secure Coding C/C++ (BTCMP-02) · sandbox provisioning
+#
+#   sq1   VM3  SonarQube Community Build + sonar-cxx in Docker   Ubuntu 24.04
+#   v1    VM2  Linux build host: g++, Valgrind (+ container),    Ubuntu 24.04
+#              sanitizers, cppcheck, clang-tidy, sonar-scanner
+#   sc1   VM1  developer workstation                             Windows 11, RDP
+#
+# The Linux hosts go first: SonarQube has to be up before V1 runs its
+# self-test analysis, and the Windows workstation is the slowest anyway.
+# All tunables are in group_vars/all.yml.
+
+# =============================================================================
+#  SQ1 + V1 - base system, trainee account, Docker Engine
+# =============================================================================
+- name: Linux hosts (SQ1, V1) - base system, trainee account, Docker
+  hosts:
+    - sq1
+    - v1
+  become: true
+
+  pre_tasks:
+    - name: Stop unattended upgrades so they cannot hold the apt lock
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - unattended-upgrades
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      failed_when: false
+
+    - name: Wait for any apt/dpkg run started at boot to finish
+      ansible.builtin.shell: |
+        for i in $(seq 1 120); do
+          fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1 || exit 0
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+  roles:
+    - role: ansible-role-user-access
+      user_access_username: "{{ cr12_trainee_user }}"
+      user_access_password: "{{ cr12_trainee_password }}"
+      user_access_sudo: true
+
+  tasks:
+    - name: Install Docker Engine and Compose v2 from the Ubuntu archive
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - curl
+          - jq
+        state: present
+        update_cache: true
+      register: cr12_apt
+      retries: 3
+      delay: 20
+      until: cr12_apt is succeeded
+
+    - name: Start Docker and enable it at boot
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Let the trainee run docker without sudo
+      ansible.builtin.user:
+        name: "{{ cr12_trainee_user }}"
+        groups: docker
+        append: true
+
+    - name: Resolve the lab machines by name
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} CADMUS-CR-12 lab hosts"
+        block: |
+          {{ cr12_ip_sc1 }} sc1
+          {{ cr12_ip_sq1 }} sq1
+          {{ cr12_ip_v1 }} v1
+
+    # SC1 reaches V1 with VS Code Remote-SSH and a password. Ubuntu cloud
+    # images disable password logins in 60-cloudimg-settings.conf; sshd uses
+    # the first value it reads, so this file has to sort before it.
+    - name: Allow password logins over SSH for the trainee account
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-cadmus-cr12.conf
+        content: |
+          # CADMUS-CR-12: VS Code Remote-SSH from SC1 logs in with a password.
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+        mode: "0644"
+      register: cr12_sshd_conf
+
+    - name: Reload sshd
+      ansible.builtin.systemd:
+        name: ssh
+        state: reloaded
+      when: cr12_sshd_conf is changed
+
+    - name: Working directory /opt/cr12
+      ansible.builtin.file:
+        path: /opt/cr12
+        state: directory
+        owner: root
+        group: docker
+        mode: "0775"
+
+# =============================================================================
+#  SQ1 (VM3) - SonarQube Community Build + sonar-cxx
+# =============================================================================
+- name: SQ1 (VM3) - SonarQube Community Build with the sonar-cxx plugin
+  hosts: sq1
+  become: true
+
+  tasks:
+    - name: Kernel settings required by SonarQube's embedded Elasticsearch
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-sonarqube.conf
+        content: |
+          vm.max_map_count=524288
+          fs.file-max=131072
+        mode: "0644"
+      register: cr12_sysctl
+
+    - name: Apply kernel settings
+      ansible.builtin.command: sysctl --system
+      when: cr12_sysctl is changed
+      changed_when: true
+
+    - name: Pull SonarQube (first pinned image that answers is used)
+      ansible.builtin.shell: |
+        for img in {{ cr12_sonarqube_images | join(' ') }}; do
+          for attempt in 1 2 3; do
+            if docker pull --quiet "$img" >/dev/null 2>&1; then
+              echo "$img"
+              exit 0
+            fi
+            sleep 15
+          done
+        done
+        echo "could not pull any of: {{ cr12_sonarqube_images | join(' ') }}" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: cr12_sq_pull
+      changed_when: false
+
+    # The container runs as uid 1000; SonarQube creates its own sub-folders
+    # under extensions/ next to plugins/.
+    - name: Extensions folder for SonarQube (owned by the container user)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0775"
+      loop:
+        - /opt/cr12/sonar-extensions
+        - /opt/cr12/sonar-extensions/plugins
+
+    - name: sonar-cxx plugin (C/C++ for SonarQube Community Build)
+      ansible.builtin.get_url:
+        url: "{{ cr12_sonar_cxx_url }}"
+        dest: "/opt/cr12/sonar-extensions/plugins/{{ cr12_sonar_cxx_url | basename }}"
+        owner: "1000"
+        group: "1000"
+        mode: "0644"
+      register: cr12_cxx_dl
+      retries: 3
+      delay: 20
+      until: cr12_cxx_dl is succeeded
+
+    - name: Write /opt/cr12/docker-compose.yml
+      ansible.builtin.template:
+        src: sq1-docker-compose.yml.j2
+        dest: /opt/cr12/docker-compose.yml
+        mode: "0644"
+      vars:
+        cr12_sonarqube_image: "{{ cr12_sq_pull.stdout | trim }}"
+
+    - name: Start SonarQube
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: /opt/cr12
+      changed_when: true
+
+    - name: Wait until SonarQube reports UP (first start takes a few minutes)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9000/api/system/status
+        return_content: true
+      register: cr12_sq_status
+      until: cr12_sq_status.json is defined and cr12_sq_status.json.status == 'UP'
+      retries: 60
+      delay: 10
+
+    # sonar-cxx ships a "Sonar way" profile in which most tool rules are
+    # inactive, so imported cppcheck / clang-tidy / Valgrind findings would be
+    # dropped. A copy with every C++ rule active is made the default.
+    # Uses the factory admin/admin credentials, which the trainee changes at
+    # first login (level A3).
+    - name: Quality profile with all C++ rules active, set as default
+      ansible.builtin.shell: |
+        set -u
+        S=http://127.0.0.1:9000; A='admin:admin'
+        installed=$(curl -s -u "$A" "$S/api/plugins/installed" | jq -r '[.plugins[].key] | join(",")')
+        echo "plugins: $installed"
+        echo "$installed" | grep -q cxx || { echo "sonar-cxx plugin NOT loaded"; exit 1; }
+        key=$(curl -s -u "$A" "$S/api/qualityprofiles/search?language=cxx" \
+              | jq -r '.profiles[] | select(.name=="CADMUS-CR-12") | .key')
+        if [ -z "$key" ]; then
+          from=$(curl -s -u "$A" "$S/api/qualityprofiles/search?language=cxx" | jq -r '.profiles[] | select(.isDefault) | .key')
+          key=$(curl -s -u "$A" -X POST "$S/api/qualityprofiles/copy" \
+                --data-urlencode "fromKey=$from" --data-urlencode "toName=CADMUS-CR-12" | jq -r '.key')
+        fi
+        [ -n "$key" ] && [ "$key" != null ] || { echo "could not create the profile"; exit 1; }
+        curl -s -u "$A" -X POST "$S/api/qualityprofiles/activate_rules" \
+             --data-urlencode "targetKey=$key" --data-urlencode "languages=cxx" | jq -c .
+        curl -s -o /dev/null -w 'set_default HTTP %{http_code}\n' -u "$A" -X POST "$S/api/qualityprofiles/set_default" \
+             --data-urlencode "language=cxx" --data-urlencode "qualityProfile=CADMUS-CR-12"
+        curl -s -u "$A" "$S/api/qualityprofiles/search?language=cxx" \
+             | jq -r '.profiles[] | "\(.name) default=\(.isDefault) activeRules=\(.activeRuleCount)"'
+      args:
+        executable: /bin/bash
+      register: cr12_profile
+      changed_when: true
+      failed_when: false
+
+# =============================================================================
+#  V1 (VM2) - Linux build host with Valgrind
+# =============================================================================
+- name: V1 (VM2) - Linux build host, Valgrind, sanitizers, analysers
+  hosts: v1
+  become: true
+
+  tasks:
+    - name: Toolchain and analysers
+      ansible.builtin.apt:
+        name: "{{ cr12_v1_packages }}"
+        state: present
+        update_cache: true
+      register: cr12_v1_apt
+      retries: 3
+      delay: 20
+      until: cr12_v1_apt is succeeded
+
+    - name: SonarScanner CLI (first URL that downloads is used)
+      ansible.builtin.shell: |
+        set -e
+        [ -x /opt/sonar-scanner/bin/sonar-scanner ] && { echo present; exit 0; }
+        for u in {{ cr12_sonar_scanner_urls | join(' ') }}; do
+          if curl -fsSL --retry 3 -o /tmp/sonar-scanner.zip "$u"; then
+            rm -rf /tmp/sonar-scanner-x && mkdir /tmp/sonar-scanner-x
+            unzip -q /tmp/sonar-scanner.zip -d /tmp/sonar-scanner-x
+            rm -rf /opt/sonar-scanner && mv /tmp/sonar-scanner-x/sonar-scanner-* /opt/sonar-scanner
+            ln -sf /opt/sonar-scanner/bin/sonar-scanner /usr/local/bin/sonar-scanner
+            rm -rf /tmp/sonar-scanner.zip /tmp/sonar-scanner-x
+            echo "installed from $u"; exit 0
+          fi
+        done
+        echo "no SonarScanner download succeeded" >&2; exit 1
+      args:
+        executable: /bin/bash
+      register: cr12_scanner
+      changed_when: "'installed' in cr12_scanner.stdout"
+
+    - name: Snyk CLI
+      ansible.builtin.get_url:
+        url: "{{ cr12_snyk_linux_url }}"
+        dest: /usr/local/bin/snyk
+        mode: "0755"
+      register: cr12_snyk_dl
+      retries: 3
+      delay: 20
+      until: cr12_snyk_dl is succeeded
+
+    # tools/scan-valgrind.sh and the support desk read files from here
+    # (finding M3 is unreachable without invoice.txt).
+    - name: Attachment folder the application reads, writable by the trainee
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ cr12_trainee_user }}"
+        group: "{{ cr12_trainee_user }}"
+        mode: "0775"
+      loop:
+        - /var/lib/vulnshop
+        - /var/lib/vulnshop/attachments
+
+    - name: Sample attachment
+      ansible.builtin.copy:
+        dest: /var/lib/vulnshop/attachments/invoice.txt
+        content: "invoice 4711\n"
+        owner: "{{ cr12_trainee_user }}"
+        group: "{{ cr12_trainee_user }}"
+        mode: "0664"
+
+    - name: Ubuntu base image for the Valgrind container (first registry that answers)
+      ansible.builtin.shell: |
+        for img in {{ cr12_ubuntu_images | join(' ') }}; do
+          for attempt in 1 2 3; do
+            if docker pull --quiet "$img" >/dev/null 2>&1; then
+              docker tag "$img" ubuntu:24.04
+              docker tag "$img" ubuntu:latest
+              echo "$img"; exit 0
+            fi
+            sleep 15
+          done
+        done
+        echo "could not pull an Ubuntu base image" >&2; exit 1
+      args:
+        executable: /bin/bash
+      register: cr12_ubuntu_pull
+      changed_when: false
+
+    - name: Valgrind container build context
+      ansible.builtin.template:
+        src: v1/valgrind.Dockerfile.j2
+        dest: /opt/cr12/valgrind.Dockerfile
+        mode: "0644"
+
+    - name: Build the Valgrind container image ({{ cr12_valgrind_image }})
+      ansible.builtin.command:
+        cmd: docker build -q -t {{ cr12_valgrind_image }} -f /opt/cr12/valgrind.Dockerfile /opt/cr12
+      register: cr12_vg_image
+      retries: 2
+      delay: 30
+      until: cr12_vg_image is succeeded
+      changed_when: true
+
+    - name: Clone the application under test (as the trainee)
+      ansible.builtin.git:
+        repo: "{{ cr12_app_repo }}"
+        dest: "{{ cr12_app_dir }}"
+        version: main
+        update: false
+      become_user: "{{ cr12_trainee_user }}"
+      register: cr12_clone
+      retries: 3
+      delay: 20
+      until: cr12_clone is succeeded
+
+    # Local-only ignores, so "git add -A" in level D1 does not pick up the
+    # analysis output. The repository itself stays exactly as published.
+    - name: Keep analysis output out of commits (local .git/info/exclude)
+      ansible.builtin.blockinfile:
+        path: "{{ cr12_app_dir }}/.git/info/exclude"
+        marker: "# {mark} CADMUS-CR-12 sandbox"
+        block: |
+          build-cc/
+          reports/
+          .scannerwork/
+          lab/asan/
+          lab/asan-build.log
+          lab/valgrind-report.txt
+      become_user: "{{ cr12_trainee_user }}"
+
+    - name: Build once, plain and sanitizer variants (as the trainee)
+      ansible.builtin.shell: |
+        set -eo pipefail
+        cd "{{ cr12_app_dir }}"
+        make -s 2>&1 | tail -n 3
+        make -s asan >/dev/null 2>&1
+        ls -l build/
+      args:
+        executable: /bin/bash
+      become_user: "{{ cr12_trainee_user }}"
+      register: cr12_build
+      changed_when: true
+
+    - name: Lab tools folder
+      ansible.builtin.file:
+        path: "{{ cr12_lab_tools_dir }}"
+        state: directory
+        owner: "{{ cr12_trainee_user }}"
+        group: "{{ cr12_trainee_user }}"
+        mode: "0755"
+
+    - name: Lab tools (scan-sonar, replay-each, valgrind-container, verify-v1)
+      ansible.builtin.template:
+        src: "v1/{{ item }}.j2"
+        dest: "{{ cr12_lab_tools_dir }}/{{ item }}"
+        owner: "{{ cr12_trainee_user }}"
+        group: "{{ cr12_trainee_user }}"
+        mode: "0755"
+      loop:
+        - scan-sonar.sh
+        - replay-each.sh
+        - valgrind-container.sh
+        - verify-v1.sh
+
+    - name: README in the trainee's home
+      ansible.builtin.template:
+        src: v1/README-CR12.txt.j2
+        dest: "/home/{{ cr12_trainee_user }}/README-CR12.txt"
+        owner: "{{ cr12_trainee_user }}"
+        group: "{{ cr12_trainee_user }}"
+        mode: "0644"
+
+    # --- self-test: the levels' answers come out of this machine ------------
+    # Runs on a scratch copy, so the trainee's checkout stays untouched.
+    - name: Self-test - Valgrind over the request corpus (expects database.cpp first)
+      ansible.builtin.shell: |
+        set -u
+        rm -rf /tmp/cr12-selftest && cp -a "{{ cr12_app_dir }}" /tmp/cr12-selftest
+        cd /tmp/cr12-selftest
+        timeout 600 docker run --rm -u "$(id -u):$(id -g)" -v "$PWD:/work" -w /work \
+            {{ cr12_valgrind_image }} ./tools/scan-valgrind.sh >/tmp/cr12-selftest-vg.log 2>&1
+        first=$(grep -m1 -A12 'Invalid read' lab/valgrind-report.txt | grep -m1 -oE '\([a-z_]+\.cpp:[0-9]+\)')
+        echo "first invalid read in: ${first:-NONE}"
+        grep -E 'Memcheck, a memory error detector|ERROR SUMMARY|Process terminating' lab/valgrind-report.txt | sed -E 's/^==[0-9]+== //'
+        APP=/tmp/cr12-selftest {{ cr12_lab_tools_dir }}/replay-each.sh 2>&1 | grep -E 'ERROR|runtime error' || true
+        echo "$first" | grep -q 'database.cpp'
+      args:
+        executable: /bin/bash
+      become_user: "{{ cr12_trainee_user }}"
+      register: cr12_selftest_vg
+      changed_when: false
+      failed_when: false
+      when: cr12_self_test
+
+    - name: Self-test - one SonarQube analysis (cppcheck + clang-tidy via sonar-cxx)
+      ansible.builtin.shell: |
+        set -u
+        S=http://sq1:9000; A='admin:admin'
+        for i in $(seq 1 60); do curl -s "$S/api/system/status" | grep -q '"UP"' && break; sleep 10; done
+        curl -s -u "$A" -X POST "$S/api/user_tokens/revoke" --data-urlencode "name=cr12-selftest" >/dev/null
+        tok=$(curl -s -u "$A" -X POST "$S/api/user_tokens/generate" \
+              --data-urlencode "name=cr12-selftest" --data-urlencode "type=GLOBAL_ANALYSIS_TOKEN" | jq -r '.token')
+        [ -n "$tok" ] && [ "$tok" != null ] || { echo "could not create a token (admin password already changed?)"; exit 1; }
+        APP=/tmp/cr12-selftest timeout 900 {{ cr12_lab_tools_dir }}/scan-sonar.sh -t "$tok" > /tmp/cr12-selftest-sonar.log 2>&1
+        rc=$?
+        grep -E '^\[|diagnostics|EXECUTION|ERROR' /tmp/cr12-selftest-sonar.log | tail -n 12
+        for i in $(seq 1 30); do
+          st=$(curl -s -u "$A" "$S/api/ce/component?component={{ cr12_sonar_project_key }}" | jq -r '.current.status // empty')
+          [ "$st" = SUCCESS ] || [ "$st" = FAILED ] && break; sleep 5
+        done
+        echo "background task: ${st:-unknown}"
+        n=$(curl -s -u "$A" "$S/api/issues/search?components={{ cr12_sonar_project_key }}&ps=1" | jq -r '.total')
+        echo "issues in SonarQube: $n"
+        curl -s -u "$A" "$S/api/issues/search?components={{ cr12_sonar_project_key }}&ps=500" \
+          | jq -r '.issues[].rule' | cut -d: -f1 | sort | uniq -c
+        curl -s -u "$A" -X POST "$S/api/user_tokens/revoke" --data-urlencode "name=cr12-selftest" >/dev/null
+        [ "$rc" = 0 ] && [ "${n:-0}" -gt 0 ]
+      args:
+        executable: /bin/bash
+      become_user: "{{ cr12_trainee_user }}"
+      register: cr12_selftest_sonar
+      changed_when: false
+      failed_when: false
+      when: cr12_self_test
+
+    - name: Remove the self-test copy
+      ansible.builtin.file:
+        path: /tmp/cr12-selftest
+        state: absent
+
+    - name: Summary (V1)
+      ansible.builtin.debug:
+        msg:
+          - "SonarScanner: {{ cr12_scanner.stdout | default('?') | trim }}"
+          - "Ubuntu base: {{ cr12_ubuntu_pull.stdout | default('?') | trim }}"
+          - "Build: {{ cr12_build.stdout_lines | default([]) | join(' | ') }}"
+          - "SELF-TEST valgrind: {{ 'PASS' if (cr12_selftest_vg.rc | default(1)) == 0 else 'FAIL' }} | {{ cr12_selftest_vg.stdout_lines | default([]) | join(' | ') }}"
+          - "SELF-TEST sonarqube: {{ 'PASS' if (cr12_selftest_sonar.rc | default(1)) == 0 else 'FAIL' }} | {{ cr12_selftest_sonar.stdout_lines | default([]) | join(' | ') }}"
+
+# =============================================================================
+#  SC1 (VM1) - Windows developer workstation
+# =============================================================================
+- name: SC1 (VM1) - Windows developer workstation
+  hosts: sc1
+  gather_facts: false
+
+  pre_tasks:
+    - name: Wait until SC1 accepts management connections
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: 10
+        timeout: 1800
+
+    - name: Make sure OpenSSH Server exists (the user-access role configures it)
+      ansible.windows.win_shell: |
+        if (Get-Service sshd -ErrorAction SilentlyContinue) { 'present'; exit 0 }
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+        Set-Service sshd -StartupType Automatic
+        Start-Service sshd
+        'installed'
+      register: cr12_sshd
+      changed_when: "'installed' in cr12_sshd.stdout"
+      failed_when: false
+
+  roles:
+    - role: ansible-role-user-access-windows
+      user_access_username: "{{ cr12_trainee_user }}"
+      user_access_password: "{{ cr12_trainee_password }}"
+      user_access_rdp: true
+      user_access_admin: true
+
+  tasks:
+    - name: Keep the trainee password from expiring during the course
+      ansible.windows.win_user:
+        name: "{{ cr12_trainee_user }}"
+        password_never_expires: true
+
+    - name: Folders for tools and lab material
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - C:\Tools\bin
+        - "{{ cr12_lab_dir_win }}"
+
+    - name: Put C:\Tools\bin on the machine PATH
+      ansible.windows.win_path:
+        elements: C:\Tools\bin
+        scope: machine
+        state: present
+
+    - name: Chocolatey packages (git, MinGW-w64 GCC, make, CMake, VS Code)
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ item.name }}"
+        install_args: "{{ item.install_args | default(omit) }}"
+        state: present
+      loop: "{{ cr12_choco_packages }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: cr12_choco
+      retries: 3
+      delay: 30
+      until: cr12_choco is succeeded
+
+    - name: Snyk CLI
+      ansible.windows.win_get_url:
+        url: "{{ cr12_snyk_win_url }}"
+        dest: C:\Tools\bin\snyk.exe
+        force: false
+      register: cr12_snyk
+      retries: 3
+      delay: 20
+      until: cr12_snyk is succeeded
+
+    - name: Postman (per-user installer, so it is installed as the trainee)
+      chocolatey.chocolatey.win_chocolatey:
+        name: postman
+        state: present
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr12_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr12_trainee_password }}"
+      when: cr12_install_postman
+      register: cr12_postman
+      ignore_errors: true
+
+    - name: VS Code extensions, SSH host list and Remote-SSH settings (trainee's profile)
+      ansible.windows.win_shell: |
+        $code = 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+        if (-not (Test-Path $code)) { throw "VS Code not found at $code" }
+        foreach ($ext in @('{{ cr12_vscode_extensions | join("','") }}')) {
+          & $code --install-extension $ext --force 2>&1 | ForEach-Object { "$_" }
+          if ($LASTEXITCODE -ne 0) { throw "code --install-extension $ext failed with exit code $LASTEXITCODE" }
+        }
+        # Remote-SSH asks for the remote platform on first connect unless told.
+        $settingsDir = Join-Path $env:APPDATA 'Code\User'
+        New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
+        $settings = Join-Path $settingsDir 'settings.json'
+        if (-not (Test-Path $settings)) {
+          '{ "remote.SSH.remotePlatform": { "v1": "linux", "sq1": "linux" } }' |
+            Set-Content -Path $settings -Encoding ASCII
+        }
+        & $code --list-extensions
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr12_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr12_trainee_password }}"
+      register: cr12_vscode_ext
+      retries: 2
+      delay: 20
+      until: cr12_vscode_ext is succeeded
+      changed_when: false
+      ignore_errors: true
+
+    - name: SSH host entries for v1 and sq1 (trainee's ~/.ssh/config)
+      ansible.windows.win_shell: |
+        $dir = Join-Path $env:USERPROFILE '.ssh'
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $cfg = [Text.Encoding]::ASCII.GetString([Convert]::FromBase64String('{{ lookup('ansible.builtin.template', 'ssh-config.j2') | b64encode }}'))
+        Set-Content -Path (Join-Path $dir 'config') -Value $cfg -Encoding ASCII -NoNewline
+        Get-Content (Join-Path $dir 'config') | Select-String '^Host '
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr12_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr12_trainee_password }}"
+      register: cr12_sshcfg
+      changed_when: false
+      ignore_errors: true
+
+    - name: Resolve the lab machines by name
+      ansible.windows.win_shell: |
+        $hosts = 'C:\Windows\System32\drivers\etc\hosts'
+        $entries = [ordered]@{ 'sc1' = '{{ cr12_ip_sc1 }}'; 'sq1' = '{{ cr12_ip_sq1 }}'; 'v1' = '{{ cr12_ip_v1 }}' }
+        $lines = @(Get-Content $hosts -ErrorAction SilentlyContinue | Where-Object {
+          $_ -notmatch ('^\s*\S+\s+(' + (($entries.Keys) -join '|') + ')\s*$') })
+        foreach ($name in $entries.Keys) { $lines += "$($entries[$name]) $name" }
+        Set-Content -Path $hosts -Value $lines -Encoding ASCII
+        Clear-DnsClientCache
+      changed_when: false
+
+    # localhost:9000 -> SQ1:9000, so SonarQube is http://localhost:9000 on SC1
+    # as in the course's lab guides.
+    - name: Port forwarding for SonarQube
+      ansible.windows.win_shell: |
+        Set-Service iphlpsvc -StartupType Automatic
+        Start-Service iphlpsvc
+        netsh interface portproxy reset | Out-Null
+        netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=9000 connectaddress={{ cr12_ip_sq1 }} connectport=9000 | Out-Null
+        netsh interface portproxy add v6tov4 listenaddress=::1 listenport=9000 connectaddress={{ cr12_ip_sq1 }} connectport=9000 | Out-Null
+        netsh interface portproxy show v4tov4
+      register: cr12_portproxy
+      changed_when: false
+
+    - name: Environment check and PATH helper
+      ansible.windows.win_template:
+        src: "{{ item }}.j2"
+        dest: '{{ cr12_lab_dir_win }}\{{ item }}'
+      loop:
+        - verify-cr-env.ps1
+        - fix-path.ps1
+
+    - name: README on the desktop
+      ansible.windows.win_template:
+        src: sc1-README.txt.j2
+        dest: C:\Users\Public\Desktop\CR-12 Sandbox README.txt
+
+    - name: Browser shortcut for SonarQube
+      ansible.windows.win_copy:
+        dest: 'C:\Users\Public\Desktop\SonarQube (SQ1).url'
+        content: "[InternetShortcut]\r\nURL=http://localhost:9000/\r\n"
+
+    - name: Desktop shortcuts - V1 terminal and Lab folder
+      ansible.windows.win_shell: |
+        $w = New-Object -ComObject WScript.Shell
+        $s = $w.CreateShortcut('C:\Users\Public\Desktop\V1 terminal.lnk')
+        $s.TargetPath = 'C:\Windows\System32\OpenSSH\ssh.exe'
+        $s.Arguments  = '{{ cr12_trainee_user }}@{{ cr12_ip_v1 }}'
+        $s.Save()
+        $s = $w.CreateShortcut('C:\Users\Public\Desktop\Lab folder.lnk')
+        $s.TargetPath = '{{ cr12_lab_dir_win }}'
+        $s.Save()
+      changed_when: false
+
+    - name: Summary (SC1)
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Postman: {{ 'skipped' if not cr12_install_postman
+            else ('FAILED - install it manually as ' ~ cr12_trainee_user if cr12_postman is failed else 'installed') }}
+          - >-
+            VS Code extensions: {{ ('FAILED - ' ~ (cr12_vscode_ext.msg | default('see log')))
+            if cr12_vscode_ext is failed else (cr12_vscode_ext.stdout_lines | default([]) | select('match', '^ms-') | join(', ')) }}
+          - "SSH config: {{ 'FAILED' if cr12_sshcfg is failed else 'written' }}"
+          - "{{ cr12_portproxy.stdout_lines | default([]) }}"
+
+    # A desktop session that existed while provisioning changed the machine
+    # PATH keeps the old PATH (CR-14 lesson). Restarting last means the
+    # trainee's first session sees every tool.
+    - name: Restart SC1 so the first trainee session starts with the final PATH
+      ansible.windows.win_reboot:
+        reboot_timeout: 1800
+        post_reboot_delay: 30
+      when: cr12_final_reboot

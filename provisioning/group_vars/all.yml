@@ -1,0 +1,103 @@
+# CADMUS-CR-12 · Secure Coding C/C++ · sandbox variables
+#
+# Everything an instructor is likely to change lives here.
+
+# --- Trainee account (same on all three machines) ----------------------------
+# The platform's networking stage already creates "user" / "Password123" on
+# every user-accessible host, and the platform's remote access uses that
+# account. The lab is therefore set up for the same account; changing the
+# password here would lock the platform's console and remote-desktop access
+# out. Lab-only credential - never reuse it elsewhere.
+cr12_trainee_user: user
+cr12_trainee_password: "Password123"
+
+# --- Addressing (must match topology.yml) ------------------------------------
+cr12_ip_sc1: 10.10.10.10
+cr12_ip_sq1: 10.10.10.20
+cr12_ip_v1: 10.10.10.30
+
+# --- Application under test ---------------------------------------------------
+# Participant build of the CR-12 application (POSIX C++17). Cloned onto V1 and
+# built there; trainees edit it from SC1 with VS Code Remote-SSH. Trainees fork
+# it on their own GitHub account for level E1 (GitHub Actions).
+cr12_app_repo: https://github.com/aradovanJava/cadmus-vulnshop-cpp-cr.git
+cr12_app_dir: /home/user/cadmus-vulnshop-cpp-cr
+cr12_lab_tools_dir: /home/user/lab-tools
+cr12_app_port: 8080
+cr12_sonar_project_key: cadmus-vulnshop-cpp-cr
+
+# --- SonarQube on SQ1 ----------------------------------------------------------
+# SonarQube Community Build has no C/C++ analyser (Sonar ships C/C++ from the
+# commercial Developer Edition up). The community plugin sonar-cxx adds a C++
+# language and imports cppcheck (and Valgrind) reports. The image is PINNED to
+# a Community Build that sonar-cxx 2.3.1 was released and tested against; a
+# newer, untested Community Build may refuse the plugin.
+# Tried in order; the first image that pulls is used. The ECR Public mirror of
+# the Docker Official Image comes first because a whole pool pulling from
+# Docker Hub anonymously hits its rate limit.
+cr12_sonarqube_images:
+  - public.ecr.aws/docker/library/sonarqube:26.1.0.118079-community
+  - docker.io/library/sonarqube:26.1.0.118079-community
+  - public.ecr.aws/docker/library/sonarqube:25.8.0.111898-community
+  - docker.io/library/sonarqube:25.8.0.111898-community
+cr12_sonar_cxx_url: https://github.com/SonarOpenCommunity/sonar-cxx/releases/download/cxx-2.3.1/sonar-cxx-plugin-2.3.1.1656.jar
+
+# --- V1: Linux build host, Valgrind --------------------------------------------
+cr12_v1_packages:
+  - acl                # lets Ansible run tasks as the trainee
+  - build-essential
+  - g++
+  - make
+  - cmake
+  - gdb
+  - valgrind
+  - cppcheck
+  - clang
+  - clang-tidy
+  - curl
+  - git
+  - jq
+  - unzip
+  - ca-certificates
+# SonarScanner CLI (the linux-x64 zip bundles its own JRE). Tried in order.
+cr12_sonar_scanner_urls:
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389-linux-x64.zip
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.2.0.5079-linux-x64.zip
+cr12_snyk_linux_url: https://static.snyk.io/cli/latest/snyk-linux
+# Base image for the Valgrind container. ubuntu:latest is also tagged from it
+# so the application's own "docker compose run --rm valgrind" needs no pull.
+cr12_ubuntu_images:
+  - public.ecr.aws/docker/library/ubuntu:24.04
+  - docker.io/library/ubuntu:24.04
+cr12_valgrind_image: cadmus-valgrind:local
+
+# Build the application, run Valgrind over it and run one SonarQube analysis
+# at the end of provisioning. Proves the sandbox works and, as the CR1
+# instructor guide recommends, warms SonarQube and makes the project appear.
+# The checks are reported in the summary; they never fail the sandbox.
+cr12_self_test: true
+
+# --- SC1 software stack (framework section 2.1, VM1) --------------------------
+cr12_snyk_win_url: https://static.snyk.io/cli/latest/snyk-win.exe
+
+# Installed with Chocolatey, machine-wide, in this order. "mingw" is the
+# MinGW-w64 GCC for Windows (the framework's GCC-win64).
+cr12_choco_packages:
+  - { name: git }
+  - { name: mingw }
+  - { name: make }
+  - { name: cmake, install_args: "ADD_CMAKE_TO_PATH=System" }
+  - { name: vscode }
+
+# VS Code extensions, installed into the trainee's own profile.
+cr12_vscode_extensions:
+  - ms-vscode.cpptools
+  - ms-vscode-remote.remote-ssh
+
+cr12_install_postman: true
+
+# Restart SC1 as the last provisioning step, so the trainee's first desktop
+# session starts with the final machine PATH (CR-14 lesson).
+cr12_final_reboot: true
+
+cr12_lab_dir_win: C:\Lab

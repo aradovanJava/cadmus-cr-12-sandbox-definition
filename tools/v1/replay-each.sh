@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# CADMUS-CR-12 - one request, one process: the sanitizer tier on V1.
+#
+#   ~/lab-tools/replay-each.sh            (run from anywhere)
+#
+# AddressSanitizer stops the process at the first error it finds (the
+# Makefile's asan target does not build with -fsanitize-recover), and the
+# request corpus contains a request that crashes the service outright (the
+# oversized search query). Replaying the whole corpus against one process
+# therefore reports the first defect and nothing after it.
+#
+# This script replays every request in tools/replay-corpus.sh against a FRESH
+# sanitizer build, one request per process, and prints the first diagnostic
+# each request produces and where. Full logs: lab/asan/NN.log
+set -uo pipefail
+
+APP="${APP:-/home/user/cadmus-vulnshop-cpp-cr}"
+cd "$APP"
+mkdir -p lab/asan /var/lib/vulnshop/attachments 2>/dev/null || true
+if [ ! -x build/vulnshop-asan ] || [ -n "$(find src include third_party -newer build/vulnshop-asan -type f -print -quit)" ]; then
+  echo "Building the sanitizer variant (make asan)..."
+  make -s asan >lab/asan-build.log 2>&1 || { echo "make asan failed - see lab/asan-build.log"; exit 1; }
+fi
+echo "invoice 4711" > /var/lib/vulnshop/attachments/invoice.txt 2>/dev/null || true
+
+H="http://127.0.0.1:8080"
+C="curl -s -o /dev/null -m 5"
+n=0
+printf '%-4s %-62s %s\n' "#" "request" "first diagnostic"
+while IFS= read -r line; do
+  case "$line" in
+    '$C '*|'printf '*) ;;
+    *) continue ;;
+  esac
+  n=$((n + 1))
+  log=$(printf 'lab/asan/%02d.log' "$n")
+  ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 \
+    ./build/vulnshop-asan config/sandbox.ini >"$log" 2>&1 &
+  pid=$!
+  for i in $(seq 1 50); do curl -s -o /dev/null -m 1 "$H/shop" && break; sleep 0.1; done
+  eval "$line" >/dev/null 2>&1
+  sleep 0.5
+  kill -TERM "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  diag=$(grep -m1 -E 'ERROR: (AddressSanitizer|LeakSanitizer)|runtime error' "$log" \
+         | sed -E 's/^==[0-9]+==//; s/ on (address )?0x.*//; s/ at pc .*//')
+  where=$(grep -oE '(src|third_party)/[A-Za-z0-9_./-]+:[0-9]+' "$log" | grep -v libsanitizer | head -1)
+  path=$(printf '%s' "$line" | grep -oE '\$H[^" ]*' | head -1 | sed 's/^\$H//')
+  case "$line" in
+    printf*)          req="POST $path  (body $(printf '%s' "$line" | sed -E "s/^printf '([^']*)'.*/\1/"))" ;;
+    *'{1..400}'*)     req="GET  /shop/search?q=AAAA... (400 characters)" ;;
+    *'-X POST'*)      req="POST $path" ;;
+    *)                req="GET  $path" ;;
+  esac
+  printf '%-4s %-62s %s\n' "$n" "$req" "${diag:+$diag @ ${where:-?}}"
+done < tools/replay-corpus.sh
+echo
+echo "Logs: $APP/lab/asan/   -  no diagnostic on a line means this request reached no defect"
+echo "Leaks (definitely lost) are reported by Valgrind: ~/lab-tools/valgrind-container.sh"

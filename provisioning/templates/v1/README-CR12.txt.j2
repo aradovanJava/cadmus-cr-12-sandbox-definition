@@ -1,0 +1,33 @@
+CADMUS-CR-12  -  Secure Coding C/C++  -  V1, the Linux build host
+==================================================================
+
+You are on V1 ({{ cr12_ip_v1 }}). The application is POSIX C++ and its dynamic
+analysis tier only exists on Linux, so it is built, run and analysed here.
+You normally reach this machine from SC1 with VS Code (Remote-SSH: host "v1")
+or with "ssh {{ cr12_trainee_user }}@v1" in a Windows terminal.
+
+  Application            {{ cr12_app_dir }}
+  Run it (loopback)      cd {{ cr12_app_dir }} && make && ./build/vulnshop config/sandbox.ini
+                         VS Code forwards port {{ cr12_app_port }} to SC1 automatically:
+                         http://localhost:{{ cr12_app_port }}/shop in the SC1 browser.
+  Valgrind (Memcheck)    ~/lab-tools/valgrind-container.sh     -> lab/valgrind-report.txt
+                         (natively:  ./tools/scan-valgrind.sh)
+  Sanitizers, per request ~/lab-tools/replay-each.sh
+  SonarQube analysis     ~/lab-tools/scan-sonar.sh -t <token>   (add -v to import Valgrind)
+  Composition (Snyk)     snyk auth  (once), then  snyk test --unmanaged
+  Environment check      ~/lab-tools/verify-v1.sh
+
+  SonarQube              http://sq1:9000 from here, http://localhost:9000 on SC1
+
+Notes
+-----
+* SonarQube Community Build has no C/C++ analyser of its own; this sandbox uses
+  the community plugin sonar-cxx, which imports cppcheck (and Valgrind)
+  reports. scan-sonar.sh does that for you. tools/scan-sonar.ps1 in the
+  repository is for the commercial C/C++ analyser and does not apply here.
+* The request corpus contains an oversized search query that crashes the
+  service (finding M7). Everything after it in a single run is not observed -
+  replay-each.sh gives every request its own process.
+* When you commit in level D1, add the files you changed by name
+  (git add src/...). Reports in lab/ and reports/ are not part of the fix.
+* The application stays on 127.0.0.1. Do not change the bind address.
