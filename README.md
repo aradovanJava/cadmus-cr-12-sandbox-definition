@@ -74,8 +74,9 @@ in the course's CR1–CR4 labs.
 5. **Self-test.** At the end of V1's provisioning the sandbox runs Valgrind
    over the corpus and one SonarQube analysis on a scratch copy, and prints
    the result in the allocation log (`SELF-TEST valgrind` / `SELF-TEST
-   sonarqube`). This also warms SonarQube and makes the project appear, as the
-   CR1 instructor guide recommends. The checks never fail the sandbox.
+   sonarqube`). The analysed project is deleted again afterwards, so trainees
+   start with an empty SonarQube and produce the results (and the project key
+   asked in A4) themselves. The checks never fail the sandbox.
 6. **Password SSH on V1/SQ1.** Ubuntu cloud images disable it; the sandbox
    re-enables it for the trainee account so Remote-SSH works without keys.
 7. **SC1 restarts as the last step**, so the first trainee session has the

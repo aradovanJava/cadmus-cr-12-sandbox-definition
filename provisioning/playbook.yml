@@ -446,6 +446,7 @@
         curl -s -u "$A" "$S/api/issues/search?components={{ cr12_sonar_project_key }}&ps=500" \
           | jq -r '.issues[].rule' | cut -d: -f1 | sort | uniq -c
         curl -s -u "$A" -X POST "$S/api/user_tokens/revoke" --data-urlencode "name=cr12-selftest" >/dev/null
+        curl -s -u "$A" -X POST "$S/api/projects/delete" --data-urlencode "project={{ cr12_sonar_project_key }}" >/dev/null
         [ "$rc" = 0 ] && [ "${n:-0}" -gt 0 ]
       args:
         executable: /bin/bash
